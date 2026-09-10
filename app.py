@@ -13,11 +13,16 @@ class Depurador:
     def depurar(self):
         # Crear df a partir del archivo CSV, tomando solo las columnas necesarias
         df_original = pd.read_csv(self.nombre_archivo, sep=";")
-        df_depurado = df_original.iloc[:, [0, 2, 3]]
+        df_depurado = df_original.iloc[:, [0, 2, 3]].copy()
         df_depurado.columns = ["Fecha-Hora", "id", "Nombre"]
 
-        # Limpiar los datos eliminando espacios en blanco
-        df_depurado["Nombre"] = df_depurado["Nombre"].str.strip()
+        # Normalizar nombres: quitar espacios sobrantes y convertir a mayúsculas
+        df_depurado["Nombre"] = (
+            df_depurado["Nombre"]
+            .str.replace(r"\s+", " ", regex=True)
+            .str.strip()
+            .str.upper()
+        )
 
         # Separar la columna "Fecha-Hora" en dos columnas: "Fecha" y "Hora"
         df_depurado[["Fecha", "Hora"]] = df_depurado["Fecha-Hora"].str.split(
@@ -51,10 +56,15 @@ class Depurador:
         # Eliminar columna auxiliar
         df_depurado = df_depurado.drop(columns=["_fecha_hora"])
 
-        # Ordenar el DataFrame por id, fecha y hora
-        df_depurado = df_depurado.sort_values(by=["Fecha", "Hora", "Nombre"]).reset_index(
-            drop=True
-        )
+        # Ordenar por fecha cronológica, hora y nombre
+        df_depurado = df_depurado.sort_values(
+            by=["Fecha", "Hora", "Nombre"],
+            key=lambda x: (
+                pd.to_datetime(x, format="%d/%m/%Y", errors="coerce")
+                if x.name == "Fecha"
+                else x
+            ),
+        ).reset_index(drop=True)
 
         return df_depurado
 
