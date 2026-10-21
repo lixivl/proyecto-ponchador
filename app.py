@@ -13,8 +13,8 @@ class Depurador:
     def depurar(self):
         # Crear df a partir del archivo CSV, tomando solo las columnas necesarias
         df_original = pd.read_csv(self.nombre_archivo, sep=";")
-        df_depurado = df_original.iloc[:, [0, 2, 3]].copy()
-        df_depurado.columns = ["Fecha-Hora", "id", "Nombre"]
+        df_depurado = df_original.iloc[:, [0, 3]].copy()
+        df_depurado.columns = ["Fecha-Hora", "Nombre"]
 
         # Normalizar nombres: quitar espacios sobrantes y convertir a mayúsculas
         df_depurado["Nombre"] = (
@@ -29,7 +29,7 @@ class Depurador:
             " ", expand=True
         )
         df_depurado = df_depurado.drop(columns=["Fecha-Hora"])
-        df_depurado = df_depurado[["Fecha", "Hora", "id", "Nombre"]]
+        df_depurado = df_depurado[["Fecha", "Hora", "Nombre"]]
 
         # eliminar filas duplicadas basadas en la columna "hora" "fecha" y "nombre"
         df_depurado = df_depurado.drop_duplicates(
@@ -47,7 +47,7 @@ class Depurador:
             by=["Fecha", "Nombre", "_fecha_hora"]
         ).reset_index(drop=True)
 
-        # Diferencia con el registro anterior del mismo día e id
+        # Diferencia con el registro anterior del mismo día
         diferencia = df_depurado.groupby(["Fecha", "Nombre"])[
             "_fecha_hora"].diff()
 
@@ -269,14 +269,13 @@ def consolidar_registros(df):
                 "Salida": grupo.iloc[-1]["Hora"]
                 if len(grupo) > 1
                 else 'Sin registro de salida',
-                "id": grupo.iloc[0]["id"],
                 "Nombre": nombre,
             }
         )
 
     consolidado = pd.DataFrame(
         registros,
-        columns=["Fecha", "Entrada", "Salida", "id", "Nombre"],
+        columns=["Fecha", "Entrada", "Salida", "Nombre"],
     )
     consolidado["_fecha"] = pd.to_datetime(
         consolidado["Fecha"], format="%d/%m/%Y", errors="coerce"
