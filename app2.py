@@ -1,22 +1,32 @@
 """
-Control de asistencia - Depurador y analizador de ponchadas
------------------------------------------------------------
+Control de asistencia - Depurador, análisis y reportes quincenales de ponchadas
+-------------------------------------------------------------------------------
 Requisitos:
-    pip install pandas pyodbc
+    pip install pandas pyodbc reportlab
     + Microsoft ODBC Driver 17 o 18 para SQL Server instalado en el equipo.
 
 Tablas que usa (esquema existente):
     dbo.DatosPonchador (Fecha, Entrada, Salida, Nombre, IdEmpleado)
-    dbo.Empleados      (Id, Nombre, IdHorario)
-    dbo.Horarios       (IdHorario, NombreHorario, HorasTurno)
+    dbo.Empleados      (Id, Nombre, IdHorario, IdDepartamento)
+    dbo.Horarios       (IdHorario, NombreHorario, HorasTurno, EntradaOficial)
+    dbo.Departamentos  (Id, Nombre)
+
+Opcional: coloca junto a este archivo logo_izquierdo.png y logo_derecho.png
+para que aparezcan en el encabezado del PDF del reporte.
 """
 
+import calendar
 import datetime as dt
 import json
+import math
 import os
+import re
 import tkinter as tk
+import webbrowser
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
+from xml.sax.saxutils import escape
 
 import pandas as pd
 
@@ -30,8 +40,15 @@ except ImportError:  # la app abre igual, pero avisa al conectar
 
 SIN_SALIDA = "Sin registro de salida"
 SIN_HORARIO = "(Sin horario)"
+SIN_DEPARTAMENTO = "(Sin departamento)"
+TODOS_DEPARTAMENTOS = "(Todos los departamentos)"
+ANIO_DATOS = 2025
+FILAS_POR_PAGINA = 15
 DIAS = ["Lunes", "Martes", "Miércoles",
         "Jueves", "Viernes", "Sábado", "Domingo"]
+MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+         "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+DIR_APP = Path(__file__).resolve().parent
 ARCHIVO_CONFIG = os.path.join(
     os.path.expanduser("~"), ".control_asistencia.json")
 
@@ -60,14 +77,28 @@ SQL_CREAR_TABLAS = [
     CREATE TABLE dbo.Horarios (
         IdHorario INT NOT NULL PRIMARY KEY,
         NombreHorario NVARCHAR(20) NULL,
-        HorasTurno DECIMAL(2,1) NULL
+        HorasTurno DECIMAL(2,1) NULL,
+        EntradaOficial VARCHAR(50) NULL
+    )""",
+    # Si dbo.Horarios ya existía sin la columna, se agrega (no toca los datos)
+    """IF OBJECT_ID('dbo.Horarios') IS NOT NULL AND COL_LENGTH('dbo.Horarios', 'EntradaOficial') IS NULL
+    ALTER TABLE dbo.Horarios ADD EntradaOficial VARCHAR(50) NULL""",
+    """IF OBJECT_ID('dbo.Departamentos') IS NULL
+    CREATE TABLE dbo.Departamentos (
+        Id INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        Nombre VARCHAR(200) NOT NULL
     )""",
     """IF OBJECT_ID('dbo.Empleados') IS NULL
     CREATE TABLE dbo.Empleados (
         Id INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
         Nombre NVARCHAR(50) NULL,
-        IdHorario INT NULL
+        IdHorario INT NULL,
+        IdDepartamento INT NULL
+            CONSTRAINT FK_Empleados_Departamentos FOREIGN KEY REFERENCES dbo.Departamentos(Id)
     )""",
+    # Si dbo.Empleados ya existía sin la columna, se agrega (no toca los datos)
+    """IF OBJECT_ID('dbo.Empleados') IS NOT NULL AND COL_LENGTH('dbo.Empleados', 'IdDepartamento') IS NULL
+    ALTER TABLE dbo.Empleados ADD IdDepartamento INT NULL""",
     """IF OBJECT_ID('dbo.DatosPonchador') IS NULL
     CREATE TABLE dbo.DatosPonchador (
         Fecha DATE NULL,
@@ -77,6 +108,33 @@ SQL_CREAR_TABLAS = [
         IdEmpleado INT NULL
     )""",
 ]
+
+SQL_PONCHADAS = (
+    "SELECT p.IdEmpleado, COALESCE(e.Nombre, p.Nombre) AS Empleado, e.IdHorario, "
+    "       h.NombreHorario, h.HorasTurno, p.Fecha, p.Entrada, p.Salida "
+    "FROM dbo.DatosPonchador p "
+    "LEFT JOIN dbo.Empleados e ON e.Id = p.IdEmpleado "
+    "LEFT JOIN dbo.Horarios h ON h.IdHorario = e.IdHorario "
+    "WHERE p.Fecha BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)"
+)
+
+
+# ============================================================ Configuración ==
+
+def leer_config():
+    try:
+        with open(ARCHIVO_CONFIG, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def escribir_config(cfg):
+    try:
+        with open(ARCHIVO_CONFIG, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=2)
+    except OSError:
+        pass
 
 
 # ================================================== Depuración (tu lógica) ==
@@ -205,21 +263,37 @@ def parse_hora(txt):
             return dt.datetime.strptime(txt, fmt).time()
         except ValueError:
             pass
-    raise ValueError(f"Hora inválida: '{txt}'")
+    raise ValueError(f"Hora inválida: '{txt}'. Usa el formato HH:MM")
+
+
+_RE_HORA = re.compile(r"(\d{1,2}):(\d{2})(?::(\d{2}))?")
 
 
 def hora_o_none(v):
-    """Convierte lo que haya en Entrada/Salida (varchar) a time; None si no es una hora."""
+    """
+    Convierte lo que haya en Entrada/Salida (varchar) a time; None si no hay una hora.
+    Tolera formatos como '8:05', '08:05:33', '08:05:33.0000000', '2025-01-06 14:02:00'
+    y '02:05 p. m.'. El texto 'Sin registro de salida' devuelve None.
+    """
     if v is None:
         return None
     if isinstance(v, dt.datetime):
         return v.time()
     if isinstance(v, dt.time):
         return v
-    try:
-        return parse_hora(v)
-    except ValueError:
+    txt = str(v).lower()
+    m = _RE_HORA.search(txt)
+    if not m:
         return None
+    h, mi, s = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+    resto = txt[m.end():]
+    if re.search(r"\bp\.?\s*m\b", resto) and h < 12:
+        h += 12
+    elif re.search(r"\ba\.?\s*m\b", resto) and h == 12:
+        h = 0
+    if h > 23 or mi > 59 or s > 59:
+        return None
+    return dt.time(h, mi, s)
 
 
 def parse_fecha(txt):
@@ -263,96 +337,485 @@ def parse_horas_turno(txt):
     return v
 
 
+def quincenas_del_anio(anio):
+    """Las 24 quincenas del año: 1-15 y 16-fin de mes."""
+    lista = []
+    for mes in range(1, 13):
+        ultimo = calendar.monthrange(anio, mes)[1]
+        lista.append((dt.date(anio, mes, 1), dt.date(anio, mes, 15)))
+        lista.append((dt.date(anio, mes, 16), dt.date(anio, mes, ultimo)))
+    return lista
+
+
+def etiqueta_quincena(n, ini, fin):
+    return f"Q{n:02d} · {ini.day} al {fin.day} de {MESES[ini.month - 1]}"
+
+
+def texto_periodo(ini, fin):
+    if ini.month == fin.month and ini.year == fin.year:
+        return f"{ini.day} al {fin.day} de {MESES[ini.month - 1]} de {ini.year}"
+    return (f"{ini.day} de {MESES[ini.month - 1]} de {ini.year} al "
+            f"{fin.day} de {MESES[fin.month - 1]} de {fin.year}")
+
+
+def letra_turno(nombre_horario):
+    n = (nombre_horario or "").strip().upper()
+    if n.startswith("MAT"):
+        return "M"
+    if n.startswith("VES"):
+        return "V"
+    return ""
+
+
 # ================================================================ Análisis ==
 
-def analizar(ponchadas, tolerancia_min):
-    """
-    Compara, por persona y día, las horas trabajadas (salida - entrada) contra las
-    HorasTurno del horario asignado al empleado.
-
-    Devuelve (detalle_filas, detalle_tags, resumen_filas, resumen_tags).
-    Los días sin salida registrada no se pueden medir: se cuentan aparte y no
-    entran en las horas trabajadas ni en las esperadas.
-    """
+def agrupar_dias(ponchadas):
+    """Una entrada por (empleado, fecha): primera entrada y última salida válidas."""
     dias = {}
     for p in ponchadas:
         if p["Fecha"] is None:
             continue
         fecha = a_fecha(p["Fecha"])
         clave = p["IdEmpleado"] if p["IdEmpleado"] is not None else p["Empleado"]
-        turno = float(p["HorasTurno"]) if p["HorasTurno"] is not None else None
         d = dias.setdefault((clave, fecha), dict(
-            nombre=p["Empleado"], horario=p["NombreHorario"], turno=turno, ents=[], sals=[]))
+            nombre=p["Empleado"], horario=p["NombreHorario"], id_horario=p["IdHorario"],
+            turno=float(p["HorasTurno"]
+                        ) if p["HorasTurno"] is not None else None,
+            ents=[], sals=[]))
         ent, sal = hora_o_none(p["Entrada"]), hora_o_none(p["Salida"])
         if ent:
             d["ents"].append(ent)
         if sal:
             d["sals"].append(sal)
-
-    detalle, resumen = [], {}
-    for (clave, fecha), d in sorted(dias.items(), key=lambda kv: (kv[0][1], str(kv[1]["nombre"]))):
+    for d in dias.values():
         ent = min(d["ents"]) if d["ents"] else None
         sal = max(d["sals"]) if d["sals"] else None
         if ent and sal and sal <= ent:
             sal = None  # una sola marca repetida: no hay salida real
+        d["ent"], d["sal"] = ent, sal
+    return dias
+
+
+def minutos_retardo(ent, oficial, tolerancia):
+    """
+    Regla UTN: pasada la tolerancia se empiezan a contar los minutos de retardo.
+    Ej.: oficial 08:00, tolerancia 10 -> entrada 08:24 = 14 minutos (08:10 o antes = 0).
+    Se comparan horas y minutos (los segundos se ignoran).
+    """
+    if ent is None or oficial is None:
+        return 0
+    limite = oficial.hour * 60 + oficial.minute + tolerancia
+    return max(0, ent.hour * 60 + ent.minute - limite)
+
+
+COLS_DETALLE = ["Fecha", "Día", "Empleado", "Horario", "Entrada", "Salida", "Hrs turno",
+                "Hrs trabajadas", "Diferencia (h)", "Estado entrada", "Estado turno"]
+COLS_SEMANAL = ["Semana del", "Empleado", "Horario", "Días con registro", "Retardos",
+                "Turnos completos", "Turnos incompletos", "Sin salida",
+                "Hrs trabajadas", "Hrs esperadas", "Diferencia (h)"]
+COLS_PERIODO = ["Empleado", "Horario", "Días con registro", "Retardos", "Turnos completos",
+                "Turnos incompletos", "Sin salida", "Hrs trabajadas", "Hrs esperadas",
+                "Diferencia (h)"]
+
+
+def _fila_resumen(r):
+    dif = f"{(r['trab'] - r['esperado']) / 60:+.2f}" if r["esperado"] else "—"
+    return [r["dias"], r["retardos"], r["completos"], r["incompletos"], r["sin_salida"],
+            fmt_horas(r["trab"]), fmt_horas(r["esperado"]), dif]
+
+
+def _tag_resumen(r):
+    if r["sin_salida"]:
+        return "mal"
+    if r["incompletos"] or r["retardos"]:
+        return "alerta"
+    return "neutro" if r["esperado"] == 0 else "ok"
+
+
+def analizar(ponchadas, tol_turno, entradas_oficiales, tol_entrada):
+    """
+    Por persona y día evalúa:
+      - Entrada: retardo si supera la hora oficial del horario + tolerancia
+        (solo si el horario tiene hora oficial configurada).
+      - Turno: horas entre entrada y salida contra HorasTurno (menos tolerancia).
+    Los días sin salida no se pueden medir: se cuentan aparte y no entran en horas.
+    Devuelve dict con 'detalle', 'semanal' y 'periodo' (cada uno: (filas, tags)).
+    """
+    dias = agrupar_dias(ponchadas)
+    detalle, semanal, periodo = [], {}, {}
+
+    def nuevo():
+        return dict(nombre=None, horario=None, dias=0, retardos=0, completos=0,
+                    incompletos=0, sin_salida=0, trab=0.0, esperado=0.0)
+
+    for (clave, fecha), d in sorted(dias.items(), key=lambda kv: (kv[0][1], str(kv[1]["nombre"]))):
+        ent, sal = d["ent"], d["sal"]
         trab = (a_min(sal) - a_min(ent)) if (ent and sal) else 0.0
         turno_min = d["turno"] * 60 if d["turno"] is not None else None
+        oficial = entradas_oficiales.get(d["id_horario"])
+        ret = minutos_retardo(ent, oficial, tol_entrada)
+
+        if ent is None:
+            est_ent = "Sin entrada"
+        elif oficial is None:
+            est_ent = "Sin hora oficial"
+        elif ret:
+            est_ent = f"Retardo ({ret} min)"
+        else:
+            est_ent = "A tiempo"
 
         lunes = fecha - dt.timedelta(days=fecha.weekday())
-        r = resumen.setdefault((lunes, clave), dict(
-            nombre=d["nombre"], horario=d["horario"], dias=0, completos=0,
-            incompletos=0, sin_salida=0, trab=0.0, esperado=0.0))
-        r["dias"] += 1
+        accs = (semanal.setdefault((lunes, clave), nuevo()),
+                periodo.setdefault(clave, nuevo()))
+
+        def sumar(campo, valor=1):
+            for r in accs:
+                r[campo] += valor
+
+        for r in accs:
+            r["nombre"], r["horario"] = d["nombre"], d["horario"]
+        sumar("dias")
+        if ret:
+            sumar("retardos")
 
         diferencia = "—"
         if turno_min is None:
-            estado, tag = "Sin horario asignado", "neutro"
+            est_turno, tag = "Sin horario asignado", "neutro"
             if ent and sal:
-                r["trab"] += trab
+                sumar("trab", trab)
         elif ent is None:
-            estado, tag = "Entrada inválida", "mal"
+            est_turno, tag = "Entrada inválida", "mal"
         elif sal is None:
-            estado, tag = SIN_SALIDA, "mal"
-            r["sin_salida"] += 1
+            est_turno, tag = SIN_SALIDA, "mal"
+            sumar("sin_salida")
         else:
-            r["trab"] += trab
-            r["esperado"] += turno_min
+            sumar("trab", trab)
+            sumar("esperado", turno_min)
             diferencia = f"{(trab - turno_min) / 60:+.2f}"
-            if trab + tolerancia_min >= turno_min:
-                estado, tag = "Turno completo", "ok"
-                r["completos"] += 1
+            if trab + tol_turno >= turno_min:
+                est_turno, tag = "Turno completo", "ok"
+                sumar("completos")
             else:
                 falta = int(round(turno_min - trab))
-                estado, tag = f"Incompleto (faltan {falta // 60} h {falta % 60} min)", "alerta"
-                r["incompletos"] += 1
+                est_turno, tag = f"Incompleto (faltan {falta // 60} h {falta % 60} min)", "alerta"
+                sumar("incompletos")
+        if ret and tag in ("ok", "neutro"):
+            tag = "alerta"
 
         detalle.append((
-            [fecha.strftime("%d/%m/%Y"), DIAS[fecha.weekday()], d["nombre"],
-             d["horario"] or "—", fmt_hm(ent), fmt_hm(
-                 sal) if sal else SIN_SALIDA,
+            [fecha.strftime("%d/%m/%Y"), DIAS[fecha.weekday()], d["nombre"], d["horario"] or "—",
+             fmt_hm(ent), fmt_hm(sal) if sal else SIN_SALIDA,
              f"{d['turno']:.1f}" if d["turno"] is not None else "—",
-             fmt_horas(trab), diferencia, estado],
-            tag,
-        ))
+             fmt_horas(trab), diferencia, est_ent, est_turno],
+            tag))
 
-    res_filas, res_tags = [], []
-    for (lunes, _), r in sorted(resumen.items(), key=lambda kv: (kv[0][0], str(kv[1]["nombre"]))):
-        res_filas.append([
-            lunes.strftime(
-                "%d/%m/%Y"), r["nombre"], r["horario"] or "—", r["dias"],
-            r["completos"], r["incompletos"], r["sin_salida"],
-            fmt_horas(r["trab"]), fmt_horas(r["esperado"]),
-            f"{(r['trab'] - r['esperado']) / 60:+.2f}" if r["esperado"] else "—",
-        ])
-        if r["sin_salida"]:
-            res_tags.append("mal")
-        elif r["incompletos"]:
-            res_tags.append("alerta")
-        elif r["esperado"] == 0:
-            res_tags.append("neutro")
-        else:
-            res_tags.append("ok")
-    return [d[0] for d in detalle], [d[1] for d in detalle], res_filas, res_tags
+    sem_f, sem_t = [], []
+    for (lunes, _), r in sorted(semanal.items(), key=lambda kv: (kv[0][0], str(kv[1]["nombre"]))):
+        sem_f.append([lunes.strftime("%d/%m/%Y"), r["nombre"],
+                     r["horario"] or "—"] + _fila_resumen(r))
+        sem_t.append(_tag_resumen(r))
+    per_f, per_t = [], []
+    for r in sorted(periodo.values(), key=lambda r: str(r["nombre"])):
+        per_f.append([r["nombre"], r["horario"] or "—"] + _fila_resumen(r))
+        per_t.append(_tag_resumen(r))
+    return {
+        "detalle": ([x[0] for x in detalle], [x[1] for x in detalle]),
+        "semanal": (sem_f, sem_t),
+        "periodo": (per_f, per_t),
+    }
+
+
+# ================================================================ Reportes ==
+
+def construir_reporte(empleados, ponchadas, desde, hasta, entradas_oficiales,
+                      tol_entrada, seleccion=None):
+    """
+    Arma los datos del 'Control Quincenal de Asistencia'.
+    empleados: {Id: {Nombre, IdHorario, NombreHorario, Departamento}}.
+    seleccion: lista de Id; si está vacía, se incluyen los empleados con ponchadas en el periodo.
+    """
+    dias = agrupar_dias([p for p in ponchadas if p["IdEmpleado"] is not None])
+    if seleccion:
+        ids = [i for i in seleccion if i in empleados]
+    else:
+        ids = sorted({c for (c, _) in dias if c in empleados})
+    # Agrupado por departamento (cada uno inicia en su propia hoja del PDF) y luego por nombre
+    ids.sort(key=lambda i: (not empleados[i].get("Departamento"),  # sin departamento al final
+                            norm_nombre(empleados[i].get(
+                                "Departamento") or ""),
+                            norm_nombre(empleados[i]["Nombre"] or "")))
+
+    # Columnas: lunes a viernes; sábado/domingo solo si alguien ponchó ese día
+    extras = {f for (c, f) in dias if c in ids and f.weekday() >= 5}
+    fechas, f = [], desde
+    while f <= hasta:
+        if f.weekday() < 5 or f in extras:
+            fechas.append(f)
+        f += dt.timedelta(days=1)
+
+    filas = []
+    for id_ in ids:
+        e = empleados[id_]
+        oficial = entradas_oficiales.get(e["IdHorario"])
+        celdas, dias_asist, horas, retardos, omisiones = [], 0, 0.0, 0, 0
+        for fecha in fechas:
+            d = dias.get((id_, fecha))
+            ent = d["ent"] if d else None
+            sal = d["sal"] if d else None
+            ret_min = minutos_retardo(ent, oficial, tol_entrada)
+            tarde = ret_min > 0
+            # Entrada: FIE si no hay ponchada; minutos de retardo si llegó tarde; vacía si llegó a tiempo
+            # Salida: hora ponchada, o FIS si no hay ponchada
+            celdas.append(dict(
+                ent="FIE" if ent is None else (str(ret_min) if tarde else ""),
+                sal=fmt_hm(sal) if sal else "FIS",
+                tarde=tarde, ent_falta=ent is None, sal_falta=sal is None))
+            if ent:
+                dias_asist += 1
+            else:
+                omisiones += 1
+            if not sal:
+                omisiones += 1
+            if ent and sal:
+                horas += (a_min(sal) - a_min(ent)) / 60
+            if tarde:
+                retardos += 1
+        filas.append(dict(nombre=e["Nombre"] or "", turno=letra_turno(e["NombreHorario"]),
+                          departamento=e.get(
+                              "Departamento") or SIN_DEPARTAMENTO,
+                          celdas=celdas, dias=dias_asist, horas=horas,
+                          retardos=retardos, omisiones=omisiones,
+                          sin_oficial=oficial is None))
+    return {"fechas": fechas, "filas": filas}
+
+
+def generar_pdf(ruta, reporte, carrera, periodo_txt, tolerancia=10):
+    """Genera el PDF con el formato F02PGRRH02.01 (una hoja por cada 15 profesores)."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_CENTER
+        from reportlab.lib.pagesizes import letter, landscape
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.platypus import (BaseDocTemplate, Frame, PageBreak, PageTemplate,
+                                        Paragraph, Spacer, Table)
+    except ImportError:
+        raise RuntimeError(
+            "Falta instalar reportlab.\n\nEjecuta:  pip install reportlab")
+
+    W, H = landscape(letter)
+    margen = 22
+    filas, fechas = reporte["filas"], reporte["fechas"]
+    n = len(fechas)
+    # Hojas: cada departamento empieza en una hoja nueva (máx. FILAS_POR_PAGINA profesores por hoja)
+    grupos = {}
+    for fila in filas:
+        grupos.setdefault(fila.get("departamento")
+                          or SIN_DEPARTAMENTO, []).append(fila)
+    hojas = [(depto, fs[i:i + FILAS_POR_PAGINA])
+             for depto, fs in grupos.items() for i in range(0, len(fs), FILAS_POR_PAGINA)]
+    paginas = max(1, len(hojas))
+
+    w_nom, w_mv, w_tot = 128, 14, [22, 26, 20, 22]
+    disponible = (W - 2 * margen) - w_nom - w_mv - sum(w_tot)
+    w_cel = min(disponible / (2 * n), 30) if n else 30
+    col_w = [w_nom, w_mv] + [w_cel] * (2 * n) + w_tot
+    t0 = 2 + 2 * n
+
+    negro = colors.black
+    gris = colors.HexColor("#BFBFBF")
+    gris_osc = colors.HexColor("#7F7F7F")
+    ambar = colors.HexColor("#FFE08A")
+    rosa = colors.HexColor("#F8CFC4")
+
+    st_titulo = ParagraphStyle(
+        "t", fontName="Helvetica-Bold", fontSize=11, leading=13, alignment=TA_CENTER)
+    st_sub = ParagraphStyle("s", fontName="Helvetica-Bold",
+                            fontSize=7.5, leading=9, alignment=TA_CENTER)
+    st_subi = ParagraphStyle(
+        "si", parent=st_sub, fontName="Helvetica-BoldOblique")
+    st_carrera = ParagraphStyle(
+        "c", fontName="Helvetica-BoldOblique", fontSize=11, leading=14, leftIndent=18)
+    st_peq = ParagraphStyle("p", fontName="Helvetica",
+                            fontSize=7, leading=9, alignment=TA_CENTER)
+    st_nombre = ParagraphStyle(
+        "n", fontName="Helvetica", fontSize=6.5, leading=7.2)
+    st_leyenda = ParagraphStyle(
+        "l", fontName="Helvetica", fontSize=6, leading=7)
+
+    def tabla_pagina(chunk):
+        enc0 = ["NOMBRE", "", "INCIDENCIAS"] + [""] * \
+            (2 * n - 1) + ["TOTAL", "", "INCID.", ""]
+        enc1 = ["", ""]
+        for f in fechas:
+            enc1 += [str(f.day), ""]
+        enc1 += ["DIAS", "HORAS", "RET.", "OMIS."]
+        enc2 = ["", ""] + ["ENTRADA", "SALIDA"] * n + ["", "", "", ""]
+        datos, celdas_est = [enc0, enc1, enc2], []
+        for i in range(FILAS_POR_PAGINA):
+            r = 3 + i
+            if i >= len(chunk):
+                datos.append([""] * len(col_w))
+                continue
+            fila = chunk[i]
+            row = [Paragraph(escape(fila["nombre"]), st_nombre), fila["turno"]]
+            for j, c in enumerate(fila["celdas"]):
+                ce, cs = 2 + 2 * j, 3 + 2 * j
+                row += [c["ent"], c["sal"]]
+                if c["ent_falta"]:
+                    celdas_est += [("BACKGROUND", (ce, r), (ce, r), rosa),
+                                   ("FONTNAME", (ce, r), (ce, r), "Helvetica-Bold")]
+                elif c["tarde"]:
+                    celdas_est += [("BACKGROUND", (ce, r), (ce, r), ambar),
+                                   ("FONTNAME", (ce, r), (ce, r), "Helvetica-Bold")]
+                if c["sal_falta"]:
+                    celdas_est += [("BACKGROUND", (cs, r), (cs, r), rosa),
+                                   ("FONTNAME", (cs, r), (cs, r), "Helvetica-Bold")]
+            row += [str(fila["dias"]), f"{fila['horas']:.2f}",
+                    str(fila["retardos"]), str(fila["omisiones"])]
+            datos.append(row)
+
+        est = [("SPAN", (0, 0), (1, 2)), ("SPAN", (2, 0), (t0 - 1, 0)),
+               ("SPAN", (t0, 0), (t0 + 1, 0)), ("SPAN", (t0 + 2, 0), (t0 + 3, 0))]
+        est += [("SPAN", (2 + 2 * j, 1), (3 + 2 * j, 1)) for j in range(n)]
+        est += [("SPAN", (t0 + k, 1), (t0 + k, 2)) for k in range(4)]
+        est += [
+            ("BACKGROUND", (0, 0), (-1, 1), negro),
+            ("BACKGROUND", (0, 0), (1, 2), negro),
+            ("BACKGROUND", (t0, 1), (-1, 2), negro),
+            ("BACKGROUND", (2, 2), (t0 - 1, 2), colors.HexColor("#EDEDED")),
+            ("TEXTCOLOR", (0, 0), (-1, 1), colors.white),
+            ("TEXTCOLOR", (t0, 0), (-1, 2), colors.white),
+            ("TEXTCOLOR", (2, 2), (t0 - 1, 2), colors.HexColor("#444444")),
+            ("FONTNAME", (0, 0), (-1, 1), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 7),
+            ("FONTSIZE", (0, 1), (-1, 1), 6.5),
+            ("FONTNAME", (2, 2), (t0 - 1, 2), "Helvetica"),
+            ("FONTSIZE", (2, 2), (t0 - 1, 2), 4.5),
+            ("FONTSIZE", (0, 3), (-1, -1), 6.5),
+            ("LEADING", (0, 3), (-1, -1), 7),
+            ("BACKGROUND", (t0, 3), (t0, -1), colors.HexColor("#D9D9D9")),
+            ("GRID", (0, 0), (-1, -1), 0.4, negro),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("ALIGN", (0, 3), (0, -1), "LEFT"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1),
+             1), ("RIGHTPADDING", (0, 0), (-1, -1), 1),
+            ("TOPPADDING", (0, 0), (-1, -1),
+             0.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 0.5),
+        ] + celdas_est
+        t = Table(datos, colWidths=col_w, rowHeights=[
+                  11, 11, 10] + [18] * FILAS_POR_PAGINA, hAlign="CENTER")
+        t.setStyle(est)
+        return t
+
+    def leyenda():
+        items = [
+            [("FI", gris, "Falta Injustificada"), ("FIE", gris, "Falta Injustificada Entrada"),
+             ("FIS", gris, "Falta Injustificada Salida"), None],
+            [("M", gris, "Matutino"), ("V", gris, "Vespertino"),
+             ("EA", gris, "Entrada Autorizada"), ("SA", gris, "Salida Autorizada")],
+            [("PSS", gris, "Permiso sin Goce de Sueldo"),
+             ("0.00", negro, "FIE/ Horas injustificadas por omisión entrada"),
+             ("0.00", gris_osc, "FIS/ Horas injustificadas por omisión salida"), None],
+            [("", ambar, f"Número = minutos de retardo en la entrada, contados después de {tolerancia} min de tolerancia"),
+             None, None, None],
+        ]
+        datos, est = [], [("FONTSIZE", (0, 0), (-1, -1), 6.5), ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
+                          ("ALIGN", (0, 0), (-1, -1), "CENTER"), ("VALIGN",
+                                                                  (0, 0), (-1, -1), "MIDDLE"),
+                          ("TOPPADDING", (0, 0), (-1, -1), 1), ("BOTTOMPADDING", (0, 0), (-1, -1), 1)]
+        for r, fila in enumerate(items):
+            row = []
+            for c, it in enumerate(fila):
+                if it is None:
+                    row += ["", ""]
+                    continue
+                sw, color, texto = it
+                row += [sw, Paragraph(escape(texto), st_leyenda)]
+                est.append(("BACKGROUND", (2 * c, r), (2 * c, r), color))
+                if color in (negro, gris_osc):
+                    est.append(("TEXTCOLOR", (2 * c, r),
+                               (2 * c, r), colors.white))
+            datos.append(row)
+        est.append(("SPAN", (1, 3), (7, 3)))
+        t = Table(datos, colWidths=[30, 150] * 4,
+                  rowHeights=11, hAlign="CENTER")
+        t.setStyle(est)
+        return t
+
+    def firmas():
+        datos = [["Elaboró:", "", "Revisó:", "", "Recibió:"], [""] * 5,
+                 ["Analista Administrativo", "", "Jefe de Departamento de Recursos Humanos", "", "Director de Carrera"]]
+        t = Table(datos, colWidths=[190, 40, 190, 40, 190], rowHeights=[
+                  10, 26, 10], hAlign="CENTER")
+        t.setStyle([("FONTSIZE", (0, 0), (-1, -1), 6.5), ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]
+                   + [("LINEBELOW", (c, 1), (c, 1), 1.2, negro) for c in (0, 2, 4)])
+        return t
+
+    def logo(nombre):
+        for ext in (".png", ".jpg", ".jpeg"):
+            p = DIR_APP / (nombre + ext)
+            if p.exists():
+                return str(p)
+        return None
+
+    logo_izq, logo_der = logo("logo_izquierdo"), logo("logo_derecho")
+
+    def pie(c, doc):
+        c.saveState()
+        for ruta_logo, x in ((logo_izq, margen + 30), (logo_der, W - margen - 30 - 58)):
+            if ruta_logo:
+                try:
+                    c.drawImage(ruta_logo, x, H - 20 - 58, width=58, height=58,
+                                preserveAspectRatio=True, mask="auto")
+                except Exception:
+                    pass
+        c.setFont("Helvetica-Bold", 7)
+        c.drawString(margen + 18, 30, "F02PGRRH02.01")
+        caja_w, x0 = 56, W - margen - 3 * 56
+        cajas = [["Fecha revisión", "02/04/2025"],
+                 [f"Hoja {doc.page} de {paginas}"], ["Rev. 01"]]
+        for i, lineas in enumerate(cajas):
+            c.rect(x0 + i * caja_w, 18, caja_w, 22)
+            c.setFont("Helvetica-Bold", 5.5)
+            y = 29 + (len(lineas) - 1) * 3.5
+            for linea in lineas:
+                c.drawCentredString(x0 + i * caja_w + caja_w / 2, y, linea)
+                y -= 7
+        c.restoreState()
+
+    story = []
+    for p, (depto, chunk) in enumerate(hojas):
+        story += [
+            Spacer(1, 4),
+            Paragraph("UNIVERSIDAD TECNOLÓGICA DE NOGALES, SONORA", st_titulo),
+            Paragraph("Dirección de Administración y Finanzas", st_sub),
+            Paragraph("Departamento de Recursos Humanos", st_subi),
+            Paragraph(
+                "Control Quincenal de Asistencia Profesor de Asignatura", st_subi),
+            Spacer(1, 8),
+            Paragraph(f"Carrera: {escape(carrera)}", st_carrera),
+            Paragraph(f"Departamento: {escape(depto)}", st_carrera),
+            Paragraph(f"Quincena del: {escape(periodo_txt)}", st_peq),
+            Paragraph("PROFESORES DE ASIGNATURA", st_peq),
+            Spacer(1, 4),
+            tabla_pagina(chunk),
+            Spacer(1, 10),
+            leyenda(),
+            Spacer(1, 12),
+            firmas(),
+        ]
+        if p < paginas - 1:
+            story.append(PageBreak())
+
+    doc = BaseDocTemplate(ruta, pagesize=(W, H), title="Control Quincenal de Asistencia",
+                          author="Universidad Tecnológica de Nogales")
+    marco = Frame(margen, 40, W - 2 * margen, H - 40 - 20, leftPadding=0, rightPadding=0,
+                  topPadding=0, bottomPadding=0)
+    doc.addPageTemplates([PageTemplate(id="p", frames=[marco], onPage=pie)])
+    doc.build(story)
 
 
 # ========================================================== Base de datos ==
@@ -450,21 +913,114 @@ def boton(padre, texto, comando, estilo="Suave.TButton", **kw):
     return ttk.Button(padre, text=texto, command=comando, style=estilo, **kw)
 
 
+class SelectorPeriodo(ttk.LabelFrame):
+    """Elige el periodo: una de las 24 quincenas del año o (opcional) un día / rango de fechas."""
+
+    def __init__(self, padre, permitir_rango=True, anio=ANIO_DATOS):
+        super().__init__(padre, text="Periodo", padding=12)
+        self.permitir_rango = permitir_rango
+        self.v_modo = tk.StringVar(value="quincena")
+        self.v_anio = tk.StringVar(value=str(anio))
+        self.v_desde = tk.StringVar()
+        self.v_hasta = tk.StringVar()
+        self._lista = []
+
+        fila1 = ttk.Frame(self)
+        fila1.pack(fill="x")
+        if permitir_rango:
+            ttk.Radiobutton(fila1, text="Por quincena", variable=self.v_modo, value="quincena",
+                            command=self._toggle).pack(side="left")
+        else:
+            ttk.Label(fila1, text="Quincena",
+                      style="Titulo.TLabel").pack(side="left")
+        ttk.Label(fila1, text="   Año:").pack(side="left")
+        self.sp_anio = ttk.Spinbox(fila1, from_=2000, to=2100, width=6,
+                                   textvariable=self.v_anio, command=self._refrescar)
+        self.sp_anio.pack(side="left", padx=6)
+        self.sp_anio.bind("<Return>", lambda _: self._refrescar())
+        self.sp_anio.bind("<FocusOut>", lambda _: self._refrescar())
+        self.cb = ttk.Combobox(fila1, state="readonly", width=34)
+        self.cb.pack(side="left", padx=8)
+        self.cb.bind("<<ComboboxSelected>>", self._al_elegir)
+
+        if permitir_rango:
+            fila2 = ttk.Frame(self)
+            fila2.pack(fill="x", pady=(10, 0))
+            ttk.Radiobutton(fila2, text="Por día o rango de fechas", variable=self.v_modo,
+                            value="rango", command=self._toggle).pack(side="left")
+            ttk.Label(fila2, text="   Desde (DD/MM/AAAA):").pack(side="left")
+            self.e_desde = ttk.Entry(
+                fila2, textvariable=self.v_desde, width=12)
+            self.e_desde.pack(side="left", padx=6)
+            ttk.Label(fila2, text="Hasta:").pack(side="left")
+            self.e_hasta = ttk.Entry(
+                fila2, textvariable=self.v_hasta, width=12)
+            self.e_hasta.pack(side="left", padx=6)
+            ttk.Label(fila2, text="(para un solo día usa la misma fecha)",
+                      style="Suave.TLabel").pack(side="left", padx=6)
+
+        self._refrescar()
+        self._toggle()
+
+    def _refrescar(self):
+        try:
+            anio = int(self.v_anio.get())
+        except ValueError:
+            return
+        self._lista = quincenas_del_anio(anio)
+        self.cb["values"] = [etiqueta_quincena(
+            i + 1, a, b) for i, (a, b) in enumerate(self._lista)]
+        self.cb.current(max(self.cb.current(), 0))
+        self._al_elegir()
+
+    def _al_elegir(self, _=None):
+        idx = self.cb.current()
+        if idx < 0 or not self._lista:
+            return
+        ini, fin = self._lista[idx]
+        self.v_desde.set(ini.strftime("%d/%m/%Y"))
+        self.v_hasta.set(fin.strftime("%d/%m/%Y"))
+
+    def _toggle(self):
+        if not self.permitir_rango:
+            return
+        por_quincena = self.v_modo.get() == "quincena"
+        self.sp_anio.config(state="normal" if por_quincena else "disabled")
+        self.cb.config(state="readonly" if por_quincena else "disabled")
+        self.e_desde.config(state="disabled" if por_quincena else "normal")
+        self.e_hasta.config(state="disabled" if por_quincena else "normal")
+
+    def obtener(self):
+        """Devuelve (desde, hasta). Lanza ValueError con un mensaje claro si hay datos inválidos."""
+        if not self.permitir_rango or self.v_modo.get() == "quincena":
+            idx = self.cb.current()
+            if idx < 0 or not self._lista:
+                raise ValueError("Elige una quincena válida (revisa el año).")
+            return self._lista[idx]
+        desde, hasta = parse_fecha(
+            self.v_desde.get()), parse_fecha(self.v_hasta.get())
+        if hasta < desde:
+            raise ValueError(
+                "La fecha final no puede ser anterior a la inicial.")
+        return desde, hasta
+
+
 # ============================================================ Aplicación ==
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Control de asistencia — Depurador y análisis de ponchadas")
-        self.geometry("1120x740")
-        self.minsize(980, 640)
+        self.title("Control de asistencia — Depurador, análisis y reportes")
+        self.geometry("1180x780")
+        self.minsize(1000, 660)
         self.configure(bg=C["fondo"])
 
         self.db = BaseDatos()
         self.ruta_csv = None
         self.df_depurado = None
         self._empleados_cache = {}
-        self._det_cols = self._det_rows = self._res_cols = self._res_rows = None
+        self._rep_ids = []
+        self._exportables = {}
 
         self._estilos()
         self._construir_header()
@@ -475,13 +1031,17 @@ class App(tk.Tk):
         self.tab_conexion = self._tab_conexion()
         self.tab_importar = self._tab_importar()
         self.tab_empleados = self._tab_empleados()
+        self.tab_departamentos = self._tab_departamentos()
         self.tab_horarios = self._tab_horarios()
         self.tab_analisis = self._tab_analisis()
+        self.tab_reportes = self._tab_reportes()
         self.nb.add(self.tab_conexion, text="  Conexión  ")
         self.nb.add(self.tab_importar, text="  Importar y depurar  ")
         self.nb.add(self.tab_empleados, text="  Empleados  ")
+        self.nb.add(self.tab_departamentos, text="  Departamentos  ")
         self.nb.add(self.tab_horarios, text="  Horarios  ")
         self.nb.add(self.tab_analisis, text="  Análisis  ")
+        self.nb.add(self.tab_reportes, text="  Reportes  ")
         self.nb.select(self.tab_importar)
         self.nb.bind("<<NotebookTabChanged>>", self._al_cambiar_tab)
 
@@ -506,8 +1066,9 @@ class App(tk.Tk):
                     background=C["fondo"], bordercolor=C["borde"])
         s.configure("TLabelframe.Label", background=C["fondo"],
                     foreground=C["primario_osc"], font=("Segoe UI", 10, "bold"))
-        s.configure("TCheckbutton", background=C["fondo"])
-        s.map("TCheckbutton", background=[("active", C["fondo"])])
+        for w in ("TCheckbutton", "TRadiobutton"):
+            s.configure(w, background=C["fondo"])
+            s.map(w, background=[("active", C["fondo"])])
 
         s.configure("TEntry", fieldbackground="#FFFFFF",
                     bordercolor=C["borde"], padding=4)
@@ -651,27 +1212,22 @@ class App(tk.Tk):
                     usuario=self.v_usuario.get().strip(), password=self.v_password.get())
 
     def _cargar_config(self):
-        try:
-            with open(ARCHIVO_CONFIG, encoding="utf-8") as fh:
-                cfg = json.load(fh)
-            self.v_servidor.set(cfg.get("servidor", "localhost"))
-            self.v_base.set(cfg.get("base", ""))
-            self.v_usuario.set(cfg.get("usuario", ""))
-            self.v_windows.set(cfg.get("windows", True))
-            if cfg.get("driver"):
-                self.v_driver.set(cfg["driver"])
-            self._toggle_auth()
-        except (OSError, ValueError):
-            pass
+        cfg = leer_config()
+        self.v_servidor.set(cfg.get("servidor", "localhost"))
+        self.v_base.set(cfg.get("base", ""))
+        self.v_usuario.set(cfg.get("usuario", ""))
+        self.v_windows.set(cfg.get("windows", True))
+        if cfg.get("driver"):
+            self.v_driver.set(cfg["driver"])
+        self._toggle_auth()
 
     def _guardar_config(self):
-        cfg = self._cfg()
-        cfg.pop("password", None)  # nunca guardamos la contraseña en disco
-        try:
-            with open(ARCHIVO_CONFIG, "w", encoding="utf-8") as fh:
-                json.dump(cfg, fh)
-        except OSError:
-            pass
+        conexion = self._cfg()
+        # nunca guardamos la contraseña en disco
+        conexion.pop("password", None)
+        cfg = leer_config()
+        cfg.update(conexion)
+        escribir_config(cfg)
 
     def _conectar(self):
         cfg = self._cfg()
@@ -878,7 +1434,7 @@ class App(tk.Tk):
             if not messagebox.askyesno(
                 "Empleados nuevos",
                 f"{len(faltantes)} nombre(s) no existen en la tabla Empleados:\n\n{vista}\n\n"
-                "¿Registrarlos sin horario? (podrás asignarles uno en la pestaña Empleados)",
+                "¿Registrarlos sin horario ni departamento? (podrás asignarlos en la pestaña Empleados)",
             ):
                 return
 
@@ -932,8 +1488,8 @@ class App(tk.Tk):
 
     def _tab_empleados(self):
         f = ttk.Frame(self.nb, padding=14)
-        self.t_empleados = Tabla(f, ["Id", "Nombre", "Horario", "Horas del turno"], [
-                                 60, 440, 200, 130], alto=12)
+        self.t_empleados = Tabla(f, ["Id", "Nombre", "Departamento", "Horario", "Horas del turno"],
+                                 [60, 340, 280, 170, 110], alto=12)
         self.t_empleados.pack(fill="both", expand=True)
         self.t_empleados.tree.bind(
             "<<TreeviewSelect>>", self._empleado_seleccionado)
@@ -949,6 +1505,13 @@ class App(tk.Tk):
         self.cb_emp_horario = ttk.Combobox(form, textvariable=self.v_emp_horario,
                                            values=[SIN_HORARIO], state="readonly", width=30)
         self.cb_emp_horario.grid(row=0, column=3, padx=8)
+        self.v_emp_depto = tk.StringVar(value=SIN_DEPARTAMENTO)
+        ttk.Label(form, text="Departamento:").grid(
+            row=1, column=0, sticky="w", pady=(8, 0))
+        self.cb_emp_depto = ttk.Combobox(form, textvariable=self.v_emp_depto,
+                                         values=[SIN_DEPARTAMENTO], state="readonly", width=60)
+        self.cb_emp_depto.grid(row=1, column=1, columnspan=3,
+                               sticky="w", padx=8, pady=(8, 0))
 
         barra = ttk.Frame(f)
         barra.pack(fill="x", pady=10)
@@ -978,14 +1541,27 @@ class App(tk.Tk):
         if self.v_emp_horario.get() not in valores:
             self.v_emp_horario.set(SIN_HORARIO)
 
+    def _cargar_combo_departamentos(self):
+        filas = self.db.consulta(
+            "SELECT Id, Nombre FROM dbo.Departamentos ORDER BY Nombre")
+        valores = [SIN_DEPARTAMENTO] + \
+            [f"{r['Id']} · {r['Nombre']}" for r in filas]
+        self.cb_emp_depto["values"] = valores
+        if self.v_emp_depto.get() not in valores:
+            self.v_emp_depto.set(SIN_DEPARTAMENTO)
+
     def _cargar_empleados(self):
         if not self.db.conectada:
             return
         try:
             self._cargar_combo_horarios()
+            self._cargar_combo_departamentos()
             filas = self.db.consulta(
-                "SELECT e.Id, e.Nombre, e.IdHorario, h.NombreHorario, h.HorasTurno "
-                "FROM dbo.Empleados e LEFT JOIN dbo.Horarios h ON h.IdHorario = e.IdHorario "
+                "SELECT e.Id, e.Nombre, e.IdHorario, h.NombreHorario, h.HorasTurno, "
+                "       e.IdDepartamento, d.Nombre AS Departamento "
+                "FROM dbo.Empleados e "
+                "LEFT JOIN dbo.Horarios h ON h.IdHorario = e.IdHorario "
+                "LEFT JOIN dbo.Departamentos d ON d.Id = e.IdDepartamento "
                 "ORDER BY e.Nombre")
         except Exception as e:
             messagebox.showerror(
@@ -993,7 +1569,7 @@ class App(tk.Tk):
             return
         self._empleados_cache = {r["Id"]: r for r in filas}
         self.t_empleados.cargar(
-            [[r["Id"], r["Nombre"], r["NombreHorario"] or "—",
+            [[r["Id"], r["Nombre"], r["Departamento"] or "—", r["NombreHorario"] or "—",
               f"{r['HorasTurno']}" if r["HorasTurno"] is not None else "—"] for r in filas],
             ids=[r["Id"] for r in filas],
         )
@@ -1012,6 +1588,12 @@ class App(tk.Tk):
                 elegido = v
                 break
         self.v_emp_horario.set(elegido)
+        elegido = SIN_DEPARTAMENTO
+        for v in self.cb_emp_depto["values"]:
+            if r["IdDepartamento"] is not None and v.startswith(f"{r['IdDepartamento']} · "):
+                elegido = v
+                break
+        self.v_emp_depto.set(elegido)
 
     def _datos_empleado(self):
         nombre = norm_nombre(self.v_emp_nombre.get())
@@ -1023,7 +1605,8 @@ class App(tk.Tk):
             messagebox.showwarning(
                 "Nombre muy largo", "El nombre acepta máximo 50 caracteres.")
             return None
-        return nombre, self._id_de_combo(self.v_emp_horario.get())
+        return (nombre, self._id_de_combo(self.v_emp_horario.get()),
+                self._id_de_combo(self.v_emp_depto.get()))
 
     def _emp_agregar(self):
         if not self._requiere_conexion():
@@ -1033,7 +1616,7 @@ class App(tk.Tk):
             return
         try:
             self.db.ejecutar(
-                "INSERT INTO dbo.Empleados (Nombre, IdHorario) VALUES (?, ?)", datos)
+                "INSERT INTO dbo.Empleados (Nombre, IdHorario, IdDepartamento) VALUES (?, ?, ?)", datos)
         except Exception as e:
             messagebox.showerror("Error", str(e))
             return
@@ -1050,8 +1633,9 @@ class App(tk.Tk):
         if not datos:
             return
         try:
-            self.db.ejecutar("UPDATE dbo.Empleados SET Nombre = ?, IdHorario = ? WHERE Id = ?",
-                             (datos[0], datos[1], int(sel[0])))
+            self.db.ejecutar(
+                "UPDATE dbo.Empleados SET Nombre = ?, IdHorario = ?, IdDepartamento = ? WHERE Id = ?",
+                (datos[0], datos[1], datos[2], int(sel[0])))
         except Exception as e:
             messagebox.showerror("Error", str(e))
             return
@@ -1077,6 +1661,148 @@ class App(tk.Tk):
         self._cargar_empleados()
         self._estado("Empleado eliminado")
 
+    # ------------------------------------------------- Pestaña: Departamentos --
+
+    def _tab_departamentos(self):
+        f = ttk.Frame(self.nb, padding=14)
+        ttk.Label(f, text="Catálogo de departamentos. Luego se asigna a cada empleado en la pestaña "
+                          "Empleados y sirve para filtrar el reporte.",
+                  style="Suave.TLabel").pack(anchor="w", pady=(0, 8))
+
+        self.t_departamentos = Tabla(
+            f, ["Id", "Nombre", "Empleados"], [70, 640, 110], alto=9)
+        self.t_departamentos.pack(fill="both", expand=True)
+        self.t_departamentos.tree.bind(
+            "<<TreeviewSelect>>", self._departamento_seleccionado)
+
+        form = ttk.LabelFrame(f, text="Datos del departamento", padding=12)
+        form.pack(fill="x", pady=(10, 0))
+        self.v_dep_nombre = tk.StringVar()
+        ttk.Label(form, text="Nombre (máx. 200):").grid(
+            row=0, column=0, sticky="w")
+        ttk.Entry(form, textvariable=self.v_dep_nombre,
+                  width=70).grid(row=0, column=1, padx=8)
+
+        barra = ttk.Frame(f)
+        barra.pack(fill="x", pady=10)
+        boton(barra, "Agregar", self._dep_agregar,
+              "Accent.TButton").pack(side="left")
+        boton(barra, "Actualizar seleccionado",
+              self._dep_actualizar).pack(side="left", padx=8)
+        boton(barra, "Eliminar", self._dep_eliminar,
+              "Peligro.TButton").pack(side="left")
+        boton(barra, "Nuevo", self._dep_nuevo).pack(side="right")
+        return f
+
+    def _cargar_departamentos(self):
+        if not self.db.conectada:
+            return
+        try:
+            filas = self.db.consulta(
+                "SELECT d.Id, d.Nombre, COUNT(e.Id) AS Empleados "
+                "FROM dbo.Departamentos d LEFT JOIN dbo.Empleados e ON e.IdDepartamento = d.Id "
+                "GROUP BY d.Id, d.Nombre ORDER BY d.Nombre")
+        except Exception as e:
+            messagebox.showerror(
+                "Error", f"No se pudieron leer los departamentos:\n\n{e}")
+            return
+        self.t_departamentos.cargar([[r["Id"], r["Nombre"], r["Empleados"]] for r in filas],
+                                    ids=[r["Id"] for r in filas])
+        self._dep_nuevo()
+
+    def _dep_nuevo(self):
+        self.t_departamentos.tree.selection_set(())
+        self.v_dep_nombre.set("")
+
+    def _departamento_seleccionado(self, _=None):
+        sel = self.t_departamentos.tree.selection()
+        if not sel:
+            return
+        self.v_dep_nombre.set(
+            self.t_departamentos.tree.item(sel[0], "values")[1])
+
+    def _datos_departamento(self, id_actual=None):
+        """Valida el nombre y que no exista otro igual. Devuelve el nombre o None."""
+        nombre = " ".join(self.v_dep_nombre.get().split())
+        if not nombre or len(nombre) > 200:
+            messagebox.showwarning("Nombre inválido",
+                                   "El nombre es obligatorio y acepta máximo 200 caracteres.")
+            return None
+        try:
+            repetido = self.db.consulta(
+                "SELECT COUNT(*) AS n FROM dbo.Departamentos WHERE Nombre = ? AND Id <> ?",
+                (nombre, id_actual if id_actual is not None else -1))[0]["n"]
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            return None
+        if repetido:
+            messagebox.showwarning(
+                "Departamento repetido", "Ya existe un departamento con ese nombre.")
+            return None
+        return nombre
+
+    def _dep_agregar(self):
+        if not self._requiere_conexion():
+            return
+        nombre = self._datos_departamento()
+        if not nombre:
+            return
+        try:
+            self.db.ejecutar(
+                "INSERT INTO dbo.Departamentos (Nombre) VALUES (?)", (nombre,))
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            return
+        self._cargar_departamentos()
+        self._estado(f"Departamento agregado: {nombre}")
+
+    def _dep_actualizar(self):
+        sel = self.t_departamentos.tree.selection()
+        if not sel:
+            messagebox.showinfo("Selecciona un departamento",
+                                "Elige un departamento de la lista.")
+            return
+        id_ = int(sel[0])
+        nombre = self._datos_departamento(id_)
+        if not nombre:
+            return
+        try:
+            self.db.ejecutar(
+                "UPDATE dbo.Departamentos SET Nombre = ? WHERE Id = ?", (nombre, id_))
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            return
+        self._cargar_departamentos()
+        self._estado("Departamento actualizado")
+
+    def _dep_eliminar(self):
+        sel = self.t_departamentos.tree.selection()
+        if not sel:
+            return
+        id_ = int(sel[0])
+        try:
+            n = self.db.consulta("SELECT COUNT(*) AS n FROM dbo.Empleados WHERE IdDepartamento = ?",
+                                 (id_,))[0]["n"]
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            return
+        if n:
+            messagebox.showwarning(
+                "Departamento en uso",
+                f"Este departamento está asignado a {n} empleado(s). "
+                "Cámbiales el departamento antes de eliminarlo.")
+            return
+        if not messagebox.askyesno("Eliminar departamento", "¿Eliminar el departamento seleccionado?"):
+            return
+        try:
+            self.db.ejecutar(
+                "DELETE FROM dbo.Departamentos WHERE Id = ?", (id_,))
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            return
+        self._cargar_departamentos()
+        self._estado("Departamento eliminado")
+
     # ------------------------------------------------------ Pestaña: Horarios --
 
     def _tab_horarios(self):
@@ -1085,8 +1811,8 @@ class App(tk.Tk):
                           "Luego se asigna a cada empleado en la pestaña Empleados.",
                   style="Suave.TLabel").pack(anchor="w", pady=(0, 8))
 
-        self.t_horarios = Tabla(f, ["Id", "Horario", "Horas del turno"], [
-                                80, 280, 150], alto=10)
+        self.t_horarios = Tabla(f, ["Id", "Horario", "Horas del turno", "Entrada oficial"], [
+                                70, 260, 130, 140], alto=9)
         self.t_horarios.pack(fill="both", expand=True)
         self.t_horarios.tree.bind(
             "<<TreeviewSelect>>", self._horario_seleccionado)
@@ -1096,6 +1822,7 @@ class App(tk.Tk):
         self.v_hor_id = tk.StringVar()
         self.v_hor_nombre = tk.StringVar()
         self.v_hor_horas = tk.StringVar(value="8.0")
+        self.v_hor_ent = tk.StringVar()
         ttk.Label(form, text="Id:").grid(row=0, column=0, sticky="w")
         ttk.Entry(form, textvariable=self.v_hor_id,
                   width=8).grid(row=0, column=1, padx=8)
@@ -1107,6 +1834,13 @@ class App(tk.Tk):
             row=0, column=4, sticky="w")
         ttk.Entry(form, textvariable=self.v_hor_horas,
                   width=8).grid(row=0, column=5, padx=8)
+        ttk.Label(form, text="Entrada oficial (HH:MM):").grid(
+            row=1, column=2, sticky="w", pady=(8, 0))
+        ttk.Entry(form, textvariable=self.v_hor_ent, width=10).grid(
+            row=1, column=3, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(form, style="Suave.TLabel",
+                  text="Opcional. Se guarda en dbo.Horarios (columna EntradaOficial) y sirve para calcular los retardos."
+                  ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(6, 0))
 
         barra = ttk.Frame(f)
         barra.pack(fill="x", pady=10)
@@ -1119,19 +1853,36 @@ class App(tk.Tk):
         boton(barra, "Nuevo", self._hor_nuevo).pack(side="right")
         return f
 
+    def _entradas_oficiales(self):
+        """{IdHorario: time} leído de dbo.Horarios.EntradaOficial (varchar). Vacío/ilegible = sin hora oficial."""
+        res = {}
+        for r in self.db.consulta("SELECT IdHorario, EntradaOficial FROM dbo.Horarios"):
+            hora = hora_o_none(r["EntradaOficial"])
+            if hora:
+                res[r["IdHorario"]] = hora
+        return res
+
     def _cargar_horarios(self):
         if not self.db.conectada:
             return
         try:
             filas = self.db.consulta(
-                "SELECT IdHorario, NombreHorario, HorasTurno FROM dbo.Horarios ORDER BY IdHorario")
+                "SELECT IdHorario, NombreHorario, HorasTurno, EntradaOficial "
+                "FROM dbo.Horarios ORDER BY IdHorario")
         except Exception as e:
             messagebox.showerror(
                 "Error", f"No se pudieron leer los horarios:\n\n{e}")
             return
+
+        def texto_entrada(v):
+            hora = hora_o_none(v)
+            if hora:
+                return fmt_hm(hora)
+            return str(v).strip() if v is not None and str(v).strip() else "—"
+
         self.t_horarios.cargar(
-            [[r["IdHorario"], r["NombreHorario"], r["HorasTurno"]]
-                for r in filas],
+            [[r["IdHorario"], r["NombreHorario"], r["HorasTurno"], texto_entrada(r["EntradaOficial"])]
+             for r in filas],
             ids=[r["IdHorario"] for r in filas])
         self._hor_nuevo(filas)
 
@@ -1147,6 +1898,7 @@ class App(tk.Tk):
         self.v_hor_id.set(str(siguiente))
         self.v_hor_nombre.set("")
         self.v_hor_horas.set("8.0")
+        self.v_hor_ent.set("")
 
     def _horario_seleccionado(self, _=None):
         sel = self.t_horarios.tree.selection()
@@ -1156,6 +1908,7 @@ class App(tk.Tk):
         self.v_hor_id.set(vals[0])
         self.v_hor_nombre.set(vals[1])
         self.v_hor_horas.set(vals[2])
+        self.v_hor_ent.set("" if vals[3] == "—" else vals[3])
 
     def _datos_horario(self, con_id):
         try:
@@ -1171,10 +1924,13 @@ class App(tk.Tk):
             return None
         try:
             horas = parse_horas_turno(self.v_hor_horas.get())
+            ent_txt = self.v_hor_ent.get().strip()
+            entrada = parse_hora(ent_txt).strftime(
+                "%H:%M") if ent_txt else None
         except ValueError as e:
-            messagebox.showwarning("Horas inválidas", str(e))
+            messagebox.showwarning("Dato inválido", str(e))
             return None
-        return id_, nombre, horas
+        return id_, nombre, horas, entrada
 
     def _hor_agregar(self):
         if not self._requiere_conexion():
@@ -1182,9 +1938,12 @@ class App(tk.Tk):
         datos = self._datos_horario(con_id=True)
         if not datos:
             return
+        id_, nombre, horas, entrada = datos
         try:
             self.db.ejecutar(
-                "INSERT INTO dbo.Horarios (IdHorario, NombreHorario, HorasTurno) VALUES (?, ?, ?)", datos)
+                "INSERT INTO dbo.Horarios (IdHorario, NombreHorario, HorasTurno, EntradaOficial) "
+                "VALUES (?, ?, ?, ?)",
+                (id_, nombre, horas, entrada))
         except Exception as e:
             messagebox.showerror("Error (¿el Id ya existe?)", str(e))
             return
@@ -1200,10 +1959,12 @@ class App(tk.Tk):
         datos = self._datos_horario(con_id=False)
         if not datos:
             return
+        _, nombre, horas, entrada = datos
         try:
             self.db.ejecutar(
-                "UPDATE dbo.Horarios SET NombreHorario = ?, HorasTurno = ? WHERE IdHorario = ?",
-                (datos[1], datos[2], int(sel[0])))
+                "UPDATE dbo.Horarios SET NombreHorario = ?, HorasTurno = ?, EntradaOficial = ? "
+                "WHERE IdHorario = ?",
+                (nombre, horas, entrada, int(sel[0])))
         except Exception as e:
             messagebox.showerror("Error", str(e))
             return
@@ -1242,56 +2003,50 @@ class App(tk.Tk):
     def _tab_analisis(self):
         f = ttk.Frame(self.nb, padding=14)
 
+        self.sel_analisis = SelectorPeriodo(f, permitir_rango=True)
+        self.sel_analisis.pack(fill="x")
+
         filtros = ttk.LabelFrame(f, text="Parámetros del análisis", padding=12)
-        filtros.pack(fill="x")
-        hoy = dt.date.today()
-        lunes = hoy - dt.timedelta(days=hoy.weekday())
-        self.v_desde = tk.StringVar(value=lunes.strftime("%d/%m/%Y"))
-        self.v_hasta = tk.StringVar(value=hoy.strftime("%d/%m/%Y"))
-        self.v_tol = tk.StringVar(value="10")
+        filtros.pack(fill="x", pady=(8, 0))
+        self.v_tol_ent = tk.StringVar(value="10")
+        self.v_tol_turno = tk.StringVar(value="10")
         self.v_an_emp = tk.StringVar(value="Todos")
 
-        ttk.Label(filtros, text="Desde (DD/MM/AAAA):").grid(row=0,
-                                                            column=0, sticky="w")
-        ttk.Entry(filtros, textvariable=self.v_desde,
-                  width=12).grid(row=0, column=1, padx=8)
-        ttk.Label(filtros, text="Hasta:").grid(row=0, column=2, sticky="w")
-        ttk.Entry(filtros, textvariable=self.v_hasta,
-                  width=12).grid(row=0, column=3, padx=8)
-        ttk.Label(filtros, text="Empleado:").grid(row=0, column=4, sticky="w")
+        ttk.Label(filtros, text="Empleado:").grid(row=0, column=0, sticky="w")
         self.cb_an_emp = ttk.Combobox(
             filtros, textvariable=self.v_an_emp, state="readonly", width=34)
-        self.cb_an_emp.grid(row=0, column=5, padx=8)
-
-        ttk.Label(filtros, text="Tolerancia (min) para dar por completo el turno:").grid(
-            row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        ttk.Spinbox(filtros, from_=0, to=120, width=5, textvariable=self.v_tol).grid(
-            row=1, column=3, sticky="w", padx=8, pady=(8, 0))
+        self.cb_an_emp.grid(row=0, column=1, padx=8)
+        ttk.Label(filtros, text="Tolerancia de retardo (min):").grid(
+            row=0, column=2, sticky="w", padx=(16, 0))
+        ttk.Spinbox(filtros, from_=0, to=60, width=5,
+                    textvariable=self.v_tol_ent).grid(row=0, column=3, padx=8)
+        ttk.Label(filtros, text="Tolerancia de turno completo (min):").grid(
+            row=0, column=4, sticky="w", padx=(16, 0))
+        ttk.Spinbox(filtros, from_=0, to=120, width=5,
+                    textvariable=self.v_tol_turno).grid(row=0, column=5, padx=8)
 
         barra = ttk.Frame(f)
-        barra.pack(fill="x", pady=10)
+        barra.pack(fill="x", pady=8)
         boton(barra, "Analizar", self._analizar,
               "Accent.TButton").pack(side="left")
         boton(barra, "Exportar pestaña actual a CSV",
               self._exportar_analisis).pack(side="left", padx=8)
-        for texto, color in (("Turno completo", C["ok"]), ("Turno incompleto", C["alerta"]),
+        for texto, color in (("Todo en orden", C["ok"]), ("Retardo / turno incompleto", C["alerta"]),
                              ("Sin salida / error", C["mal"]), ("Sin horario", C["neutro"])):
             tk.Label(barra, text=f"  {texto}  ", bg=color, fg=C["texto"],
                      font=("Segoe UI", 9)).pack(side="right", padx=3)
 
         self.nb_res = ttk.Notebook(f)
         self.nb_res.pack(fill="both", expand=True)
-        cols_det = ["Fecha", "Día", "Empleado", "Horario", "Entrada", "Salida",
-                    "Hrs turno", "Hrs trabajadas", "Diferencia (h)", "Estado"]
-        self.t_detalle = Tabla(self.nb_res, cols_det, [
-                               90, 90, 250, 110, 70, 150, 80, 110, 110, 240], alto=10)
-        cols_res = ["Semana del", "Empleado", "Horario", "Días con registro", "Turnos completos",
-                    "Turnos incompletos", "Sin salida", "Hrs trabajadas", "Hrs esperadas", "Diferencia (h)"]
-        self.t_resumen = Tabla(self.nb_res, cols_res, [
-                               100, 250, 110, 120, 120, 130, 90, 110, 110, 110], alto=10)
-        self.nb_res.add(self.t_resumen, text="  Resumen semanal  ")
+        self.t_periodo = Tabla(self.nb_res, COLS_PERIODO,
+                               [250, 110, 120, 80, 120, 130, 90, 110, 110, 110], alto=9)
+        self.t_semanal = Tabla(self.nb_res, COLS_SEMANAL,
+                               [100, 250, 110, 120, 80, 120, 130, 90, 110, 110, 110], alto=9)
+        self.t_detalle = Tabla(self.nb_res, COLS_DETALLE,
+                               [90, 90, 250, 110, 70, 150, 80, 110, 110, 150, 240], alto=9)
+        self.nb_res.add(self.t_periodo, text="  Resumen del periodo  ")
+        self.nb_res.add(self.t_semanal, text="  Resumen semanal  ")
         self.nb_res.add(self.t_detalle, text="  Detalle diario  ")
-        self._det_cols, self._res_cols = cols_det, cols_res
         return f
 
     def _refrescar_combo_analisis(self):
@@ -1305,61 +2060,57 @@ class App(tk.Tk):
         if self.v_an_emp.get() not in valores:
             self.v_an_emp.set("Todos")
 
+    def _consultar_ponchadas(self, desde, hasta, id_emp=None):
+        sql = SQL_PONCHADAS + \
+            (" AND p.IdEmpleado = ?" if id_emp is not None else "")
+        params = [desde.isoformat(), hasta.isoformat()] + \
+            ([id_emp] if id_emp is not None else [])
+        return self.db.consulta(sql, params)
+
     def _analizar(self):
         if not self._requiere_conexion():
             return
         try:
-            desde, hasta = parse_fecha(
-                self.v_desde.get()), parse_fecha(self.v_hasta.get())
+            desde, hasta = self.sel_analisis.obtener()
         except ValueError as e:
-            messagebox.showwarning("Fecha inválida", str(e))
+            messagebox.showwarning("Periodo inválido", str(e))
             return
         try:
-            tolerancia = int(self.v_tol.get())
+            tol_ent, tol_turno = int(self.v_tol_ent.get()), int(
+                self.v_tol_turno.get())
         except ValueError:
             messagebox.showwarning(
-                "Dato inválido", "La tolerancia debe ser un número entero de minutos.")
-            return
-        if hasta < desde:
-            messagebox.showwarning(
-                "Rango inválido", "La fecha final no puede ser anterior a la inicial.")
+                "Dato inválido", "Las tolerancias deben ser números enteros de minutos.")
             return
 
-        id_emp = self._id_de_combo(self.v_an_emp.get())
-        filtro = " AND p.IdEmpleado = ?" if id_emp is not None else ""
-        params = [desde.isoformat(), hasta.isoformat()] + \
-            ([id_emp] if id_emp is not None else [])
         try:
             self._estado("Analizando…")
-            ponchadas = self.db.consulta(
-                "SELECT p.IdEmpleado, COALESCE(e.Nombre, p.Nombre) AS Empleado, "
-                "       h.NombreHorario, h.HorasTurno, p.Fecha, p.Entrada, p.Salida "
-                "FROM dbo.DatosPonchador p "
-                "LEFT JOIN dbo.Empleados e ON e.Id = p.IdEmpleado "
-                "LEFT JOIN dbo.Horarios h ON h.IdHorario = e.IdHorario "
-                "WHERE p.Fecha BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)" + filtro, params)
-            det, det_t, res, res_t = analizar(ponchadas, tolerancia)
+            ponchadas = self._consultar_ponchadas(
+                desde, hasta, self._id_de_combo(self.v_an_emp.get()))
+            res = analizar(ponchadas, tol_turno,
+                           self._entradas_oficiales(), tol_ent)
         except Exception as e:
             self._estado("Error en el análisis")
             messagebox.showerror("Error en el análisis", str(e))
             return
 
-        self.t_detalle.cargar(det, det_t)
-        self.t_resumen.cargar(res, res_t)
-        self._det_rows, self._res_rows = det, res
-        self._estado(
-            f"Análisis listo: {len(det)} registros diarios, {len(res)} resúmenes semanales")
+        self.t_periodo.cargar(*res["periodo"])
+        self.t_semanal.cargar(*res["semanal"])
+        self.t_detalle.cargar(*res["detalle"])
+        self._exportables = {0: (COLS_PERIODO, res["periodo"][0], "resumen_periodo.csv"),
+                             1: (COLS_SEMANAL, res["semanal"][0], "resumen_semanal.csv"),
+                             2: (COLS_DETALLE, res["detalle"][0], "detalle_diario.csv")}
+        self._estado(f"Análisis del {desde:%d/%m/%Y} al {hasta:%d/%m/%Y}: "
+                     f"{len(res['detalle'][0])} registros diarios, {len(res['periodo'][0])} empleados")
 
     def _exportar_analisis(self):
-        resumen = self.nb_res.index(self.nb_res.select()) == 0
-        cols = self._res_cols if resumen else self._det_cols
-        filas = self._res_rows if resumen else self._det_rows
+        cols, filas, nombre = self._exportables.get(
+            self.nb_res.index(self.nb_res.select()), (None, None, None))
         if not filas:
             messagebox.showinfo("Sin datos", "Primero ejecuta el análisis.")
             return
         destino = filedialog.asksaveasfilename(
-            title="Exportar análisis",
-            initialfile="resumen_semanal.csv" if resumen else "detalle_diario.csv",
+            title="Exportar análisis", initialfile=nombre,
             defaultextension=".csv", filetypes=[("Archivos CSV", "*.csv")])
         if not destino:
             return
@@ -1371,6 +2122,216 @@ class App(tk.Tk):
             return
         self._estado(f"Exportado a: {destino}")
 
+    # ------------------------------------------------------ Pestaña: Reportes --
+
+    def _tab_reportes(self):
+        f = ttk.Frame(self.nb, padding=14)
+
+        self.sel_reporte = SelectorPeriodo(f, permitir_rango=False)
+        self.sel_reporte.pack(fill="x")
+
+        medio = ttk.Frame(f)
+        medio.pack(fill="x", pady=8)
+
+        datos = ttk.LabelFrame(medio, text="Datos del reporte", padding=12)
+        datos.pack(side="left", fill="y")
+        self.v_carrera = tk.StringVar()
+        self.v_rep_tol = tk.StringVar(value="10")
+        ttk.Label(datos, text="Carrera:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(datos, textvariable=self.v_carrera, width=34).grid(
+            row=0, column=1, padx=8, pady=3)
+        ttk.Label(datos, text="Tolerancia de retardo (min):").grid(
+            row=1, column=0, sticky="w")
+        ttk.Spinbox(datos, from_=0, to=60, width=5, textvariable=self.v_rep_tol).grid(
+            row=1, column=1, sticky="w", padx=8, pady=3)
+        self.v_rep_depto = tk.StringVar(value=TODOS_DEPARTAMENTOS)
+        ttk.Label(datos, text="Departamento:").grid(
+            row=2, column=0, sticky="w")
+        self.cb_rep_depto = ttk.Combobox(datos, textvariable=self.v_rep_depto,
+                                         values=[TODOS_DEPARTAMENTOS], state="readonly", width=40)
+        self.cb_rep_depto.grid(row=2, column=1, sticky="w", padx=8, pady=3)
+        self.cb_rep_depto.bind("<<ComboboxSelected>>",
+                               lambda _e: self._cargar_lista_profesores())
+        ttk.Label(datos, style="Suave.TLabel", justify="left",
+                  text="Retardo = minutos después de la tolerancia, contados\ncon la «Entrada oficial» de la pestaña Horarios.").grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        prof = ttk.LabelFrame(
+            medio, text="Profesores (sin selección = todos los que tengan ponchadas)", padding=12)
+        prof.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        marco_lb = ttk.Frame(prof)
+        marco_lb.pack(side="left", fill="both", expand=True)
+        self.lb_prof = tk.Listbox(
+            marco_lb, selectmode="extended", height=6, exportselection=False, bg="#FFFFFF",
+            fg=C["texto"], selectbackground=C["primario"], selectforeground="#FFFFFF",
+            highlightthickness=1, highlightbackground=C["borde"], relief="flat",
+            activestyle="none", font=("Segoe UI", 10))
+        sb = ttk.Scrollbar(marco_lb, orient="vertical",
+                           command=self.lb_prof.yview)
+        self.lb_prof.configure(yscrollcommand=sb.set)
+        self.lb_prof.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+        botones = ttk.Frame(prof)
+        botones.pack(side="left", padx=(10, 0), anchor="n")
+        boton(botones, "Seleccionar todos",
+              lambda: self.lb_prof.selection_set(0, "end")).pack(fill="x")
+        boton(botones, "Limpiar selección", lambda: self.lb_prof.selection_clear(
+            0, "end")).pack(fill="x", pady=6)
+
+        barra = ttk.Frame(f)
+        barra.pack(fill="x", pady=(0, 8))
+        boton(barra, "Vista previa", self._reporte_vista_previa).pack(side="left")
+        boton(barra, "Generar PDF", self._reporte_pdf,
+              "Accent.TButton").pack(side="left", padx=8)
+        for texto, color in (("Todo en orden", C["ok"]), ("Con retardos", C["alerta"]), ("Con FIE / FIS", C["mal"])):
+            tk.Label(barra, text=f"  {texto}  ", bg=color, fg=C["texto"],
+                     font=("Segoe UI", 9)).pack(side="right", padx=3)
+
+        self.cont_preview = ttk.Frame(f)
+        self.cont_preview.pack(fill="both", expand=True)
+        self.t_reporte = Tabla(self.cont_preview, ["Profesor"], alto=8)
+        self.t_reporte.pack(fill="both", expand=True)
+        return f
+
+    def _cargar_filtro_departamentos(self):
+        """Refresca las opciones del filtro conservando la elección si todavía existe."""
+        try:
+            filas = self.db.consulta(
+                "SELECT Id, Nombre FROM dbo.Departamentos ORDER BY Nombre")
+        except Exception:
+            return
+        valores = [TODOS_DEPARTAMENTOS] + \
+            [f"{r['Id']} · {r['Nombre']}" for r in filas]
+        self.cb_rep_depto["values"] = valores
+        if self.v_rep_depto.get() not in valores:
+            self.v_rep_depto.set(TODOS_DEPARTAMENTOS)
+
+    def _cargar_lista_profesores(self):
+        self._cargar_filtro_departamentos()
+        id_depto = self._id_de_combo(self.v_rep_depto.get())
+        try:
+            if id_depto is None:
+                filas = self.db.consulta(
+                    "SELECT Id, Nombre FROM dbo.Empleados ORDER BY Nombre")
+            else:
+                filas = self.db.consulta(
+                    "SELECT Id, Nombre FROM dbo.Empleados WHERE IdDepartamento = ? ORDER BY Nombre",
+                    (id_depto,))
+        except Exception:
+            return
+        self._rep_ids = [r["Id"] for r in filas]
+        self.lb_prof.delete(0, "end")
+        for r in filas:
+            self.lb_prof.insert("end", r["Nombre"])
+
+    def _reporte_datos(self):
+        """Consulta la BD y arma el reporte. Devuelve (reporte, desde, hasta) o None."""
+        if not self._requiere_conexion():
+            return None
+        try:
+            desde, hasta = self.sel_reporte.obtener()
+        except ValueError as e:
+            messagebox.showwarning("Periodo inválido", str(e))
+            return None
+        try:
+            tol = int(self.v_rep_tol.get())
+        except ValueError:
+            messagebox.showwarning(
+                "Dato inválido", "La tolerancia debe ser un número entero de minutos.")
+            return None
+        try:
+            self._estado("Generando reporte…")
+            emps = self.db.consulta(
+                "SELECT e.Id, e.Nombre, e.IdHorario, h.NombreHorario, "
+                "       e.IdDepartamento, d.Nombre AS Departamento "
+                "FROM dbo.Empleados e "
+                "LEFT JOIN dbo.Horarios h ON h.IdHorario = e.IdHorario "
+                "LEFT JOIN dbo.Departamentos d ON d.Id = e.IdDepartamento")
+            id_depto = self._id_de_combo(self.v_rep_depto.get())
+            empleados = {r["Id"]: r for r in emps
+                         if id_depto is None or r["IdDepartamento"] == id_depto}
+            ponchadas = self._consultar_ponchadas(desde, hasta)
+            seleccion = [self._rep_ids[i] for i in self.lb_prof.curselection()]
+            reporte = construir_reporte(empleados, ponchadas, desde, hasta,
+                                        self._entradas_oficiales(), tol, seleccion)
+        except Exception as e:
+            self._estado("Error al generar el reporte")
+            messagebox.showerror("Error", str(e))
+            return None
+        if not reporte["filas"]:
+            self._estado("Sin ponchadas en el periodo")
+            messagebox.showinfo(
+                "Sin datos", "No hay ponchadas de los profesores elegidos en ese periodo.")
+            return None
+        sin = [f["nombre"] for f in reporte["filas"] if f["sin_oficial"]]
+        if sin:
+            vista = "\n".join(sin[:8]) + ("\n…" if len(sin) > 8 else "")
+            messagebox.showwarning(
+                "Retardos no calculados",
+                f"{len(sin)} profesor(es) no tienen un horario con «Entrada oficial» configurada "
+                f"(pestañas Empleados y Horarios), así que su entrada no puede evaluarse y saldrá vacía:\n\n{vista}")
+        con_ent = sum(f["dias"] for f in reporte["filas"])
+        con_sal = sum(1 for f in reporte["filas"]
+                      for c in f["celdas"] if not c["sal_falta"])
+        self._diag_salidas = f"{con_sal} de {con_ent} días con entrada tienen salida"
+        if con_ent and not con_sal:
+            messagebox.showwarning(
+                "Sin salidas en la base de datos",
+                f"En este periodo hay {con_ent} día(s) con entrada, pero ninguno tiene hora de salida "
+                "en DatosPonchador (la columna Salida está vacía o sin una hora válida).\n\n"
+                "Revisa los datos guardados para ese periodo.")
+        return reporte, desde, hasta, tol
+
+    def _reporte_vista_previa(self):
+        r = self._reporte_datos()
+        if not r:
+            return
+        reporte, desde, hasta, _ = r
+        cols = ["Profesor", "Departamento", "T"]
+        for f in reporte["fechas"]:
+            cols += [f"{f.day:02d} Ent.", f"{f.day:02d} Sal."]
+        cols += ["Días", "Horas", "Ret.", "Omis."]
+        anchos = [260, 220, 30] + [78] * \
+            (2 * len(reporte["fechas"])) + [55, 65, 50, 55]
+
+        self.t_reporte.destroy()
+        self.t_reporte = Tabla(self.cont_preview, cols, anchos, alto=8)
+        self.t_reporte.pack(fill="both", expand=True)
+        filas, tags = [], []
+        for fila in reporte["filas"]:
+            vals = [fila["nombre"], fila["departamento"], fila["turno"]]
+            for c in fila["celdas"]:
+                vals += [c["ent"], c["sal"]]
+            vals += [fila["dias"], f"{fila['horas']:.2f}",
+                     fila["retardos"], fila["omisiones"]]
+            filas.append(vals)
+            tags.append("mal" if fila["omisiones"] else (
+                "alerta" if fila["retardos"] else "ok"))
+        self.t_reporte.cargar(filas, tags)
+        self._estado(f"Vista previa: {len(filas)} profesores, quincena del {texto_periodo(desde, hasta)}. "
+                     f"{self._diag_salidas}. Entrada: minutos de retardo, vacía = a tiempo, FIE = sin entrada. Salida: FIS = sin salida")
+
+    def _reporte_pdf(self):
+        r = self._reporte_datos()
+        if not r:
+            return
+        reporte, desde, hasta, tol = r
+        destino = filedialog.asksaveasfilename(
+            title="Guardar reporte quincenal",
+            initialfile=f"Control_quincenal_{desde:%Y-%m-%d}_al_{hasta:%Y-%m-%d}.pdf",
+            defaultextension=".pdf", filetypes=[("Archivos PDF", "*.pdf")])
+        if not destino:
+            return
+        try:
+            generar_pdf(destino, reporte, self.v_carrera.get(
+            ).strip(), texto_periodo(desde, hasta), tol)
+        except Exception as e:
+            messagebox.showerror("Error al generar el PDF", str(e))
+            return
+        self._estado(f"PDF guardado en: {destino}")
+        if messagebox.askyesno("Reporte generado", "El PDF se generó correctamente.\n¿Quieres abrirlo ahora?"):
+            webbrowser.open(Path(destino).resolve().as_uri())
+
     # ------------------------------------------------------------- Eventos --
 
     def _al_cambiar_tab(self, _=None):
@@ -1379,10 +2340,14 @@ class App(tk.Tk):
         tab = self.nb.tab(self.nb.select(), "text").strip()
         if tab == "Empleados":
             self._cargar_empleados()
+        elif tab == "Departamentos":
+            self._cargar_departamentos()
         elif tab == "Horarios":
             self._cargar_horarios()
         elif tab == "Análisis":
             self._refrescar_combo_analisis()
+        elif tab == "Reportes":
+            self._cargar_lista_profesores()
 
 
 if __name__ == "__main__":
